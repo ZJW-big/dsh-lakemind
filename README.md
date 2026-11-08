@@ -6,7 +6,7 @@
 
 它把已有的 `meow-memory` 记忆库读成一片同心涟漪：越靠近圆心越重要，每一圈水波有各自的淡化节奏——内核几乎不动，浮沫几天就散。人格一部分来自你手写的种子，一部分从记忆里长出来。
 
-![设置页](docs/preview.png)
+![设置页](https://gcore.jsdelivr.net/gh/ZJW-big/dsh-lakemind@main/docs/preview.png)
 
 ---
 
@@ -54,7 +54,7 @@ rmdir /s /q "%DSH_HOME%\profiles\desktop\node_modules\dsh-lakemind"
 mklink /J "%DSH_HOME%\profiles\desktop\node_modules\dsh-lakemind" "F:\deepseek\work\dsh-soulstar"
 ```
 
-客户端插件的改动，刷新窗口即可；宿主侧改动要重启应用。
+客户端插件的改动要**重启宿主进程**才会重新组包（只刷新窗口会继续拿到缓存的旧 bundle）；宿主侧改动同样要重启。
 
 ---
 
