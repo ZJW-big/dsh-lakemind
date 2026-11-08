@@ -1,5 +1,5 @@
 // dsh-lakemind host 半边：读 meow-memory SQLite、拼人格、跑心跳、注册工具与 HTTP。
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,10 +13,35 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// 临时排查：确认模块是否被宿主 import（写死绝对路径，绕开一切路径推导）。
-try {
-  writeFileSync('C:/Users/pc/lakemind-import.log', `${new Date().toISOString()} imported by pid ${process.pid}\n`, { encoding: 'utf8', flag: 'a' });
-} catch {}
+// 日志轮转：插件自己的日志会随运行时间无限增长（之前 host-boot.log 堆到 80KB+），
+// 超过阈值就滚成 .1，只保留一代，避免把用户磁盘写满。
+const MAX_LOG_BYTES = 512 * 1024;
+// 人格段落进系统提示，给个硬上限，防止手写的种子文件写飞。
+const MAX_PERSONA_CHARS = 4000;
+
+function appendLogRotating(file, line) {
+  try {
+    ensureDir(dirname(file));
+    let size = 0;
+    try {
+      size = statSync(file).size;
+    } catch {
+      size = 0;
+    }
+    if (size > MAX_LOG_BYTES) {
+      try {
+        renameSync(file, file + '.1');
+      } catch {
+        try {
+          writeFileSync(file, '', 'utf8');
+        } catch {}
+      }
+    }
+    writeFileSync(file, line, { encoding: 'utf8', flag: 'a' });
+  } catch {
+    /* 日志失败绝不影响功能 */
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Paths & config
@@ -59,14 +84,21 @@ function loadState(home) {
   const p = stateFile(home);
   if (!existsSync(p)) return {};
   try {
-    return JSON.parse(readFileSync(p, 'utf8'));
+    const data = JSON.parse(readFileSync(p, 'utf8'));
+    // 只接受普通对象：数组 / null / 数字都会让后面的展开合并出意外结果。
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return {};
+    return data;
   } catch {
     return {};
   }
 }
 
 function saveState(home, state) {
-  writeFileSync(stateFile(home), JSON.stringify(state, null, 2), 'utf8');
+  // 先写临时文件再 rename：中途崩溃也不会留下半截 JSON 把配置读坏。
+  const target = stateFile(home);
+  const tmp = `${target}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  renameSync(tmp, target);
 }
 
 function loadSeed(home) {
@@ -142,14 +174,50 @@ function candidateRoots(workspaceRoots) {
   return out;
 }
 
-function listActiveMemories(dbPath) {
-  if (!dbPath || !existsSync(dbPath)) return [];
-  const sqlite = getSqlite();
-  if (!sqlite || typeof sqlite.DatabaseSync !== 'function') return [];
-  const db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+/** meow-memory 以后可能加新表：先看库里实际有哪些表，再退回固定清单。 */
+function resolveLevels(db) {
+  const known = [];
+  let names = [];
   try {
-    const out = [];
-    for (const level of MEMORY_LEVELS) {
+    names = db.prepare(`select name from sqlite_master where type = 'table'`).all().map((r) => String(r.name));
+  } catch {
+    return MEMORY_LEVELS.slice();
+  }
+  for (const n of MEMORY_LEVELS) if (names.includes(n)) known.push(n);
+  if (known.length === 0) return MEMORY_LEVELS.slice();
+  for (const n of names) {
+    if (known.includes(n) || MEMORY_LEVELS.includes(n)) continue;
+    if (/^(sqlite_|dream_log$|windows$)/i.test(n)) continue;
+    try {
+      const cols = db.prepare(`pragma table_info("${n.replace(/"/g, '""')}")`).all().map((c) => String(c.name));
+      if (cols.includes('content') && cols.includes('importance') && cols.includes('status')) known.push(n);
+    } catch {}
+  }
+  return known;
+}
+
+function listActiveMemories(dbPath) {
+  const empty = { rows: [], busy: false, error: '' };
+  if (!dbPath || !existsSync(dbPath)) return empty;
+  const sqlite = getSqlite();
+  if (!sqlite || typeof sqlite.DatabaseSync !== 'function') {
+    return { rows: [], busy: false, error: sqliteError || 'node:sqlite unavailable' };
+  }
+
+  let db;
+  try {
+    // 只读打开：meow-memory 正在写入时这里可能拿不到锁，别让异常冒到上层。
+    db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { rows: [], busy: /busy|locked/i.test(msg), error: msg };
+  }
+
+  const out = [];
+  let busy = false;
+  let error = '';
+  try {
+    for (const level of resolveLevels(db)) {
       try {
         const rows = db
           .prepare(
@@ -169,9 +237,15 @@ function listActiveMemories(dbPath) {
           }
           out.push({ ...r, level, keywords: Array.isArray(kw) ? kw : [] });
         }
-      } catch {}
+      } catch (e) {
+        // 被锁住时这一层读不到——标记出来，让上层不要缓存这份残缺结果。
+        // 其他错误（库损坏、表结构不对）也要记下来，否则界面上只会显示"没有涟漪"。
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/busy|locked/i.test(msg)) busy = true;
+        else if (!error) error = msg;
+      }
     }
-    return out;
+    return { rows: out, busy, error };
   } finally {
     try {
       db.close();
@@ -192,23 +266,37 @@ function computeLake(workspaceRoots) {
 
   const memories = [];
   const ids = new Set();
+  let unstable = false;
+  let readError = '';
   for (const dbPath of dbs) {
-    for (const m of listActiveMemories(dbPath)) {
+    const { rows, busy, error } = listActiveMemories(dbPath);
+    if (busy) unstable = true;
+    if (error && !readError) readError = `${dbPath}: ${error}`;
+    for (const m of rows) {
       if (ids.has(m.id)) continue;
       ids.add(m.id);
       memories.push(m);
     }
   }
 
-  const ripples = memories.map(buildRipple);
+  const ripples = [];
+  for (const m of memories) {
+    try {
+      ripples.push(buildRipple(m));
+    } catch {
+      /* 单条脏数据不该让整片湖消失 */
+    }
+  }
   const bandBrightness = aggregateBandBrightness(ripples);
   return {
     dbPath: dbs[0] || null,
     dbPaths: dbs,
-    total: memories.length,
+    total: ripples.length,
     ripples,
     bandBrightness: Object.fromEntries(bandBrightness),
-    sqliteError,
+    sqliteError: readError || sqliteError,
+    // 被 SQLite 锁住时读到的是残缺结果：上层据此跳过缓存，下次重算。
+    unstable,
     computedAt: Date.now(),
   };
 }
@@ -218,18 +306,30 @@ function computeLake(workspaceRoots) {
 // ---------------------------------------------------------------------------
 
 function assemblePersona(home) {
-  const seed = (loadSeed(home) || '').trim();
-  const emerged = loadEmerged(home)
-    .filter((e) => e && typeof e.text === 'string')
-    .sort((a, b) => (Number(b.confidence || 0) - Number(a.confidence || 0)) || (Number(b.since || 0) - Number(a.since || 0)))
-    .slice(0, 12);
+  // 人格段会直接进系统提示：任何一个文件读失败都不该让这一轮对话崩掉，所以全部兜底。
+  let seed = '';
+  try {
+    seed = (loadSeed(home) || '').trim();
+  } catch {
+    seed = '';
+  }
+  let emerged = [];
+  try {
+    emerged = loadEmerged(home)
+      .filter((e) => e && typeof e.text === 'string' && e.text.trim())
+      .sort((a, b) => (Number(b.confidence || 0) - Number(a.confidence || 0)) || (Number(b.since || 0) - Number(a.since || 0)))
+      .slice(0, 12);
+  } catch {
+    emerged = [];
+  }
   if (!seed && emerged.length === 0) return '';
   const parts = [];
-  if (seed) parts.push(seed);
+  // 种子人格是手写文件，写太长会把提示挤爆——留一个上限。
+  if (seed) parts.push(seed.slice(0, MAX_PERSONA_CHARS));
   if (emerged.length > 0) {
     parts.push('');
     parts.push('我逐渐意识到自己：');
-    for (const e of emerged) parts.push('- ' + e.text);
+    for (const e of emerged) parts.push('- ' + e.text.trim().slice(0, 200));
   }
   return parts.join('\n');
 }
@@ -248,11 +348,9 @@ export function apply(ctx, config) {
   ensureDir(home);
 
   // 宿主侧的落盘日志：插件自身问题排查用（ctx.logger 在桌面端不一定可见）。
+  // 走轮转写入，避免长期运行把日志堆到几十上百 KB。
   const hostLog = (msg) => {
-    try {
-      const dir = ensureDir(join(home, 'logs'));
-      writeFileSync(join(dir, 'host-boot.log'), `${new Date().toISOString()} ${msg}\n`, { encoding: 'utf8', flag: 'a' });
-    } catch {}
+    appendLogRotating(join(home, 'logs', 'host-boot.log'), `${new Date().toISOString()} ${msg}\n`);
   };
   hostLog(`apply start (cwd=${process.cwd()})`);
 
@@ -271,8 +369,21 @@ export function apply(ctx, config) {
   };
 
   // 工作区根目录：优先问宿主的 workspaceRegistry（用户在界面上登记过的项目），
-  // 拿不到再退回环境变量 / cwd。之前只看 cwd，结果读的是 profile 里的空库。
+  // 拿不到再退回环境变量 / cwd。
   let loggedRegistryOnce = false;
+
+  // registry 的条目形状是 { id, record: { path, title, sessionIds } }，
+  // 路径在 record 里面而不是顶层。之前只在顶层找 path，永远找不到，
+  // 湖能读对纯粹是因为 cwd 兜底刚好也落在同一个目录——换个工作区就瞎了。
+  function pickPath(obj, depth) {
+    if (!obj || typeof obj !== 'object' || depth > 2) return null;
+    for (const key of ['path', 'directory', 'root', 'cwd', 'dir', 'fullPath', 'canonicalPath']) {
+      const p = obj[key];
+      if (typeof p === 'string' && p.trim()) return p.trim();
+    }
+    return pickPath(obj.record, depth + 1);
+  }
+
   function workspaceRoots() {
     const roots = [];
     try {
@@ -285,21 +396,15 @@ export function apply(ctx, config) {
           hostLog(`workspaceRegistry has ${list.length} entries; first = ${JSON.stringify(list[0]).slice(0, 300)}`);
         }
         for (const w of list) {
-          if (!w || typeof w !== 'object') continue;
-          for (const key of ['path', 'directory', 'root', 'cwd', 'dir', 'fullPath', 'canonicalPath']) {
-            const p = w[key];
-            if (typeof p === 'string' && p) {
-              roots.push(p);
-              break;
-            }
-          }
+          const p = pickPath(w, 0);
+          if (p) roots.push(p);
         }
       }
     } catch (e) {
       hostLog(`workspaceRegistry unavailable: ${e instanceof Error ? e.message : String(e)}`);
     }
     const envRoot = process.env.DSH_WORKSPACE;
-    if (envRoot) roots.push(envRoot);
+    if (envRoot && !roots.includes(envRoot)) roots.push(envRoot);
 
     // 真找不到时，退一步把 cwd 及其父目录都试一遍（记忆库按 <workspace>/.dsh-meow 放）。
     if (roots.length === 0) {
@@ -319,56 +424,87 @@ export function apply(ctx, config) {
   let cachedLakeAt = 0;
   const LAKE_TTL_MS = 15_000;
 
+  function emptyLake(reason) {
+    const bandBrightness = {};
+    for (const b of BANDS) bandBrightness[b.id] = 0;
+    return {
+      dbPath: null,
+      dbPaths: [],
+      total: 0,
+      ripples: [],
+      bandBrightness,
+      sqliteError: reason || '',
+      unstable: false,
+      computedAt: Date.now(),
+    };
+  }
+
   function getLake() {
     const now = Date.now();
     if (cachedLake && now - cachedLakeAt < LAKE_TTL_MS) return cachedLake;
-    cachedLake = computeLake(workspaceRoots());
-    cachedLakeAt = now;
-    return cachedLake;
+    let next;
+    try {
+      next = computeLake(workspaceRoots());
+    } catch (e) {
+      // 读库失败绝不能让异常冒进系统提示：那会让每一轮对话都直接失败。
+      const msg = e instanceof Error ? e.message : String(e);
+      hostLog(`computeLake failed: ${msg}`);
+      next = emptyLake(msg);
+    }
+    // 半锁状态下的残缺结果不缓存，下一轮重算。
+    if (!next.unstable) {
+      cachedLake = next;
+      cachedLakeAt = now;
+    }
+    return next;
   }
 
   // --- Persona + lake context（systemPrompt 不是可注入服务，按 meow-memory 的做法轮询取）---
   const attachPromptParts = (attempt = 0) => {
-    let svc;
     try {
-      svc = typeof ctx.get === 'function' ? ctx.get('systemPrompt') : ctx.systemPrompt;
-    } catch {
-      svc = undefined;
-    }
-    if (!svc || typeof svc.section !== 'function') {
-      if (attempt < 20) {
-        setTimeout(() => attachPromptParts(attempt + 1), 500);
-      } else {
-        hostLog('systemPrompt 10s 内未就绪，人格与湖面上下文注入跳过');
+      let svc;
+      try {
+        svc = typeof ctx.get === 'function' ? ctx.get('systemPrompt') : ctx.systemPrompt;
+      } catch {
+        svc = undefined;
       }
-      return;
-    }
+      if (!svc || typeof svc.section !== 'function') {
+        if (attempt < 20) {
+          setTimeout(() => attachPromptParts(attempt + 1), 500);
+        } else {
+          hostLog('systemPrompt 10s 内未就绪，人格与湖面上下文注入跳过');
+        }
+        return;
+      }
 
-    safe('persona', () => {
+      // 只读一次种子文件，注册与日志共用同一份文本。
       const personaText = assemblePersona(home);
-      if (!personaText) return undefined;
-      return svc.section({
-        name: 'dsh-lakemind:persona',
-        order: 50, // 在 harness 身份(-1000)与部署人格前缀(0)之后、工具说明之前
-        text: personaText,
-      });
-    });
+      if (personaText) {
+        safe('persona', () => svc.section({
+          name: 'dsh-lakemind:persona',
+          order: 50, // 在 harness 身份(-1000)与部署人格前缀(0)之后、工具说明之前
+          text: personaText,
+        }));
+      }
 
-    safe('lake-context', () => svc.context({
-      name: 'dsh-lakemind:lake-summary',
-      order: 200,
-      text: () => {
-        // 每轮都要进上下文，所以只留一行，细节交给 lakemind_glimpse 工具按需取。
-        const lake = getLake();
-        if (!lake.total) return '记忆湖：暂无涟漪（未找到记忆库）。';
-        const bands = BANDS
-          .map((b) => `${b.name}:${Math.round(lake.bandBrightness[b.id] || 0)}`)
-          .join(' ');
-        return `记忆湖：${lake.total} 条涟漪（${bands}）。`;
-      },
-    }));
+      safe('lake-context', () => svc.context({
+        name: 'dsh-lakemind:lake-summary',
+        order: 200,
+        text: () => {
+          // 每轮都要进上下文，所以只留一行，细节交给 lakemind_glimpse 工具按需取。
+          const lake = getLake();
+          if (!lake.total) return '记忆湖：暂无涟漪（未找到记忆库）。';
+          const bands = BANDS
+            .map((b) => `${b.name}:${Math.round(lake.bandBrightness[b.id] || 0)}`)
+            .join(' ');
+          return `记忆湖：${lake.total} 条涟漪（${bands}）。`;
+        },
+      }));
 
-    hostLog(`prompt parts attached (personaChars=${assemblePersona(home).length})`);
+      hostLog(`prompt parts attached (personaChars=${personaText.length})`);
+    } catch (e) {
+      hostLog(`attachPromptParts failed: ${e instanceof Error ? e.stack || e.message : String(e)}`);
+    }
   };
   attachPromptParts();
 
@@ -449,10 +585,38 @@ export function apply(ctx, config) {
   // --- HTTP API for client -------------------------------------------------
   // 用 exact 路由（image-gen 等插件的写法），每个端点单独注册；prefix 匹配在桌面端不稳。
   const sendJson = (res, status, obj) => {
+    if (res.writableEnded) return;
     res.statusCode = status;
     res.setHeader('content-type', 'application/json; charset=utf-8');
+    // 面板每 5 秒轮询一次 /state，不显式禁缓存的话浏览器可能一直拿到旧湖面。
+    res.setHeader('cache-control', 'no-store');
     res.end(JSON.stringify(obj));
   };
+
+  const MAX_BODY_BYTES = 256 * 1024;
+  async function readJsonBody(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      // 不设上限就是把内存交给请求方，一个超大 body 能把宿主拖死。
+      if (size > MAX_BODY_BYTES) {
+        const err = new Error('body too large');
+        err.statusCode = 413;
+        throw err;
+      }
+      chunks.push(chunk);
+    }
+    const raw = Buffer.concat(chunks).toString('utf8');
+    if (!raw.trim()) return {};
+    try {
+      return JSON.parse(raw);
+    } catch {
+      const err = new Error('invalid json');
+      err.statusCode = 400;
+      throw err;
+    }
+  }
 
   const registerRoute = (routePath, methods, handler) => {
     safe(`route ${routePath}`, () => ctx.effect(() => ctx.webServer.register({
@@ -460,51 +624,108 @@ export function apply(ctx, config) {
       path: routePath,
       handler: async (req, res) => {
         const method = (req.method || 'GET').toUpperCase();
-        if (methods && !methods.includes(method)) return sendJson(res, 405, { error: 'method not allowed' });
+        if (methods && !methods.includes(method)) {
+          res.setHeader('allow', methods.join(', '));
+          return sendJson(res, 405, { error: 'method not allowed' });
+        }
         try {
           await handler(req, res, method);
         } catch (e) {
-          hostLog(`route ${routePath} threw: ${e instanceof Error ? e.stack || e.message : String(e)}`);
+          const status = Number(e && e.statusCode) || 500;
+          if (status >= 500) hostLog(`route ${routePath} threw: ${e instanceof Error ? e.stack || e.message : String(e)}`);
           try {
-            if (!res.writableEnded) sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
+            sendJson(res, status, { error: e instanceof Error ? e.message : String(e) });
           } catch {}
         }
       },
     }), `dsh-lakemind: route ${routePath}`));
   };
 
+  // 同一处报错反复上报（例如某个槽位每次渲染都炸）只记一条，避免诊断日志被刷爆。
+  const diagSeen = new Map();
+  const DIAG_DEDUPE_MS = 5 * 60 * 1000;
+
   registerRoute('/lakemind-7350/state', ['GET'], async (req, res) => {
     const lake = getLake();
+    // 只发画布真正要用的字段。完整记忆原文留在宿主侧——
+    // 之前每条记忆的 content/title 都跟着轮询发到浏览器，一次 26KB、其中 12.9K 字是私人内容。
+    const lite = {
+      total: lake.total,
+      dbPath: lake.dbPath,
+      dbPaths: lake.dbPaths,
+      bandBrightness: lake.bandBrightness,
+      sqliteError: lake.sqliteError,
+      computedAt: lake.computedAt,
+      ripples: lake.ripples.map((r) => ({
+        id: r.id,
+        status: r.status,
+        radius: Number(r.radius.toFixed(4)),
+        weight: Number(r.weight.toFixed(4)),
+        angle: Number(r.angle.toFixed(4)),
+        hue: r.hue,
+        bandName: r.bandName,
+      })),
+    };
     const persona = assemblePersona(home);
-    sendJson(res, 200, { lake, personaPreview: persona.slice(0, 400), home, roots: workspaceRoots() });
+    sendJson(res, 200, { lake: lite, personaPreview: persona.slice(0, 400), home, roots: workspaceRoots() });
   });
+
+  // 允许写进 state.json 的键白名单：之前是把请求体整份展开合并，
+  // 客户端传什么都会原样落盘，包括垃圾键和嵌套对象。
+  const ALLOWED_CONFIG_KEYS = ['heartbeatMinutes', 'cooldownMinutes', 'speakUp', 'quietHours'];
 
   registerRoute('/lakemind-7350/config', ['GET', 'POST'], async (req, res, method) => {
     if (method === 'GET') return sendJson(res, 200, loadState(home));
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    let parsed;
-    try {
-      parsed = JSON.parse(body || '{}');
-    } catch {
-      return sendJson(res, 400, { error: 'invalid json' });
+    const parsed = await readJsonBody(req);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return sendJson(res, 400, { error: 'body must be an object' });
     }
-    const next = { ...loadState(home), ...parsed, updatedAt: Date.now() };
+    const patch = {};
+    for (const key of ALLOWED_CONFIG_KEYS) {
+      const value = parsed[key];
+      if (value === undefined || value === null) continue;
+      if (key === 'speakUp') {
+        patch[key] = Boolean(value);
+      } else if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+        patch[key] = value;
+      }
+    }
+    const next = { ...loadState(home), ...patch, updatedAt: Date.now() };
     saveState(home, next);
     return sendJson(res, 200, next);
   });
 
-  registerRoute('/lakemind-7350/seed', ['GET'], async (req, res) => {
-    sendJson(res, 200, { seed: loadSeed(home) });
+  const MAX_SEED_BYTES = 64 * 1024;
+
+  registerRoute('/lakemind-7350/seed', ['GET', 'POST'], async (req, res, method) => {
+    if (method === 'GET') return sendJson(res, 200, { seed: loadSeed(home) });
+    const parsed = await readJsonBody(req);
+    if (!parsed || typeof parsed.seed !== 'string') {
+      return sendJson(res, 400, { error: 'seed must be a string' });
+    }
+    if (Buffer.byteLength(parsed.seed, 'utf8') > MAX_SEED_BYTES) {
+      return sendJson(res, 413, { error: 'seed too large' });
+    }
+    // 原来只有 GET：设置页里改的人格点保存后其实什么都没写进去，等于白改。
+    writeFileSync(seedFile(home), parsed.seed, 'utf8');
+    return sendJson(res, 200, { ok: true, chars: parsed.seed.length });
   });
 
   registerRoute('/lakemind-7350/diag', ['POST'], async (req, res) => {
-    let body = '';
-    for await (const chunk of req) body += chunk;
-    try {
-      const logDir = ensureDir(join(home, 'logs'));
-      writeFileSync(join(logDir, 'client-diag.log'), `${new Date().toISOString()} ${body}\n`, { encoding: 'utf8', flag: 'a' });
-    } catch {}
+    const parsed = await readJsonBody(req).catch(() => null);
+    if (parsed) {
+      const key = `${parsed.where || parsed.stage || '?'}|${String(parsed.message || parsed.extra || '').slice(0, 200)}`;
+      const last = diagSeen.get(key) || 0;
+      if (Date.now() - last < DIAG_DEDUPE_MS) {
+        return sendJson(res, 200, { ok: true, deduped: true });
+      }
+      diagSeen.set(key, Date.now());
+      if (diagSeen.size > 200) diagSeen.clear();
+    }
+    appendLogRotating(
+      join(home, 'logs', 'client-diag.log'),
+      `${new Date().toISOString()} ${parsed ? JSON.stringify(parsed).slice(0, 6000) : '(unparsable diag)'}\n`,
+    );
     sendJson(res, 200, { ok: true });
   });
 
