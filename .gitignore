@@ -1,0 +1,9 @@
+# 运行时 / 调试产物，不进仓库
+node_modules/
+.tmp/
+scripts/
+*.log
+*.bak
+*.bak-*
+docs/raw-shot.png
+.smoke-home/
