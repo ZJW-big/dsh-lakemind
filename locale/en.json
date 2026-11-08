@@ -1,0 +1,18 @@
+{
+  "nav": "Memory Lake",
+  "settings.title": "Ripple Memory Lake",
+  "settings.seedLabel": "Seed persona (editable)",
+  "settings.seedDesc": "This text is the base of my personality and is injected into every conversation.",
+  "settings.heartbeatMinutes": "Heartbeat interval (minutes)",
+  "settings.cooldownMinutes": "Proactive speak cooldown (minutes)",
+  "settings.quietStart": "Quiet hours start (HH:mm)",
+  "settings.quietEnd": "Quiet hours end (HH:mm)",
+  "settings.speakUp": "Allow proactive messages",
+  "settings.save": "Save",
+  "lake.empty": "The lake is still empty. Memories will grow in over time.",
+  "lake.band.core": "Core",
+  "lake.band.spine": "Spine",
+  "lake.band.recent": "Recent",
+  "lake.band.surface": "Surface",
+  "lake.band.foam": "Foam"
+}
