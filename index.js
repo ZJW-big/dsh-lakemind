@@ -272,14 +272,16 @@ export function apply(ctx, config) {
 
   // 工作区根目录：优先问宿主的 workspaceRegistry（用户在界面上登记过的项目），
   // 拿不到再退回环境变量 / cwd。之前只看 cwd，结果读的是 profile 里的空库。
+  let loggedRegistryOnce = false;
   function workspaceRoots() {
     const roots = [];
     try {
       const reg = typeof ctx.get === 'function' ? ctx.get('workspaceRegistry') : ctx.workspaceRegistry;
       if (reg && typeof reg.list === 'function') {
         const list = reg.list() || [];
-        if (list.length > 0) {
-          // 记录真实字段形状，万一以后字段名变了，日志里能直接看到。
+        if (list.length > 0 && !loggedRegistryOnce) {
+          // 只在首次记录真实字段形状，否则每次取湖都会重复写一行（会撑爆日志）。
+          loggedRegistryOnce = true;
           hostLog(`workspaceRegistry has ${list.length} entries; first = ${JSON.stringify(list[0]).slice(0, 300)}`);
         }
         for (const w of list) {
@@ -389,7 +391,19 @@ export function apply(ctx, config) {
           required: ['total', 'bands', 'top'],
           properties: {
             total: { type: 'integer' },
-            bands: { type: 'object', additionalProperties: { type: 'number' } },
+            // 注意：DSH 的 schema 校验只接受 additionalProperties: false|true，
+            // 写成子 schema（additionalProperties: { type: 'number' }）会让整个工具注册失败。
+            bands: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                core: { type: 'number' },
+                spine: { type: 'number' },
+                recent: { type: 'number' },
+                surface: { type: 'number' },
+                foam: { type: 'number' },
+              },
+            },
             top: {
               type: 'array',
               items: {
@@ -419,12 +433,14 @@ export function apply(ctx, config) {
       async execute(args) {
         const lake = getLake();
         const limit = Math.max(1, Math.min(20, Number(args?.limit) || 8));
+        const bands = {};
+        for (const b of BANDS) bands[b.name] = Number((lake.bandBrightness[b.id] || 0).toFixed(2));
         const top = [...lake.ripples]
           .filter((r) => r.status !== 'archived')
           .sort((a, b) => b.weight - a.weight)
           .slice(0, limit)
           .map((r) => ({ id: r.id, level: r.level, bandName: r.bandName, weight: Number(r.weight.toFixed(4)), title: String(r.title || r.content || '').slice(0, 60) }));
-        return { total: lake.total, bands: lake.bandBrightness, top };
+        return { total: lake.total, bands, top };
       },
     };
     return ctx.tools.register(tool);
