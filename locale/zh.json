@@ -1,0 +1,18 @@
+{
+  "nav": "记忆湖",
+  "settings.title": "涟漪记忆湖",
+  "settings.seedLabel": "种子人格（你可以直接编辑）",
+  "settings.seedDesc": "这段文字是人格的底色，会原样注入每次对话。",
+  "settings.heartbeatMinutes": "心跳间隔（分钟）",
+  "settings.cooldownMinutes": "主动发言冷却（分钟）",
+  "settings.quietStart": "安静时段开始（HH:mm）",
+  "settings.quietEnd": "安静时段结束（HH:mm）",
+  "settings.speakUp": "允许主动找你说话",
+  "settings.save": "保存",
+  "lake.empty": "湖面还是空的，等记忆慢慢长进来。",
+  "lake.band.core": "内核",
+  "lake.band.spine": "骨架",
+  "lake.band.recent": "近期",
+  "lake.band.surface": "表层",
+  "lake.band.foam": "浮沫"
+}
