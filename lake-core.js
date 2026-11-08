@@ -49,7 +49,9 @@ export function keywordAngle(keywords) {
     h ^= str.charCodeAt(i);
     h = Math.imul(h, 16777619) >>> 0;
   }
-  return (h % 360) * (Math.PI / 180);
+  // 用整个 32 位的比值而不是 h % 360：离散成 360 档时，
+  // 几十条记忆里必然撞角，两条会精确叠在同一个点上。
+  return (h / 4294967296) * Math.PI * 2;
 }
 
 export function levelHue(level) {
@@ -70,7 +72,7 @@ export function keywordJitter(keywords) {
   }
   h = Math.imul(h ^ (h >>> 15), 2246822507) >>> 0;
   h = (h ^ (h >>> 13)) >>> 0;
-  return (h % 10000) / 10000;
+  return (h % 1000000) / 1000000;
 }
 
 export function buildRipple(memory) {
@@ -83,9 +85,15 @@ export function buildRipple(memory) {
     bandHalfLifeDays: band.halfLifeDays,
     recallCount: memory.hit_count,
   });
-  const angle = keywordAngle(memory.keywords);
-  // 环带由 importance 决定（语义不变），带内的具体半径由关键词稳定散列决定
-  const jitter = keywordJitter(memory.keywords);
+  // 没有关键词的记忆若都退回空串，散列结果完全相同，这一批会精确叠在同一个点上。
+  // 所以退到 id，再退到标题/正文。
+  const hasKeywords = Array.isArray(memory.keywords) && memory.keywords.length > 0;
+  const seed = hasKeywords
+    ? memory.keywords
+    : String(memory.id || memory.title || memory.content || '');
+  const angle = keywordAngle(seed);
+  // 环带由 importance 决定（语义不变），带内的具体半径由这个种子稳定散列决定
+  const jitter = keywordJitter(seed);
   const radius = Math.max(0, Math.min(1, band.rMin + (band.rMax - band.rMin) * jitter));
   return {
     id: memory.id,
