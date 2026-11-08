@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-lakemind
+      name: 'dsh-lakemind'
+      config: {}
