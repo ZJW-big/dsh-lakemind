@@ -56,9 +56,26 @@ export function levelHue(level) {
   return LEVEL_HUE[String(level).toLowerCase()] ?? 220;
 }
 
+/**
+ * 稳定散列出 0..1 的小数，用来在同一条环带里给记忆一点半径抖动。
+ * 没有它时 importance 只会映射出 4 个固定半径，同分记忆会挤成一条正圆，
+ * 几十个光点叠在一起看着像噪点而不是涟漪。
+ */
+export function keywordJitter(keywords) {
+  const str = Array.isArray(keywords) ? keywords.join('|') : String(keywords || '');
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  h = Math.imul(h ^ (h >>> 15), 2246822507) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0;
+  return (h % 10000) / 10000;
+}
+
 export function buildRipple(memory) {
-  const r = importanceToRadius(memory.importance);
-  const band = bandOfRadius(r);
+  const baseRadius = importanceToRadius(memory.importance);
+  const band = bandOfRadius(baseRadius);
   const weight = computeWeight({
     createdAt: memory.created_at,
     updatedAt: memory.updated_at,
@@ -67,12 +84,16 @@ export function buildRipple(memory) {
     recallCount: memory.hit_count,
   });
   const angle = keywordAngle(memory.keywords);
+  // 环带由 importance 决定（语义不变），带内的具体半径由关键词稳定散列决定
+  const jitter = keywordJitter(memory.keywords);
+  const radius = Math.max(0, Math.min(1, band.rMin + (band.rMax - band.rMin) * jitter));
   return {
     id: memory.id,
     level: memory.level,
     status: memory.status,
     importance: memory.importance,
-    radius: r,
+    radius,
+    baseRadius,
     bandId: band.id,
     bandName: band.name,
     weight,
