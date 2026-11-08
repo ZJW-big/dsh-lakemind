@@ -72,6 +72,8 @@ mklink /J "%DSH_HOME%\profiles\desktop\node_modules\dsh-lakemind" "F:\deepseek\w
 
 HTTP 端点（供前端用）：`/lakemind-7350/state`、`/config`、`/seed`、`/diag`。
 
+`/state` 只下发画布要用的字段（位置、亮度、颜色、环带），**不会**把记忆原文送到浏览器；`/config` 只接收白名单里的键；`/diag` 会去重并按 512 KB 轮转。
+
 ---
 
 ## 目录
@@ -79,7 +81,8 @@ HTTP 端点（供前端用）：`/lakemind-7350/state`、`/config`、`/seed`、`
 ```
 index.js           宿主半：读 SQLite、拼人格、注册工具与 HTTP
 client.js          浏览器半：设置页 + 湖面画布
-lake-core.js       纯函数：半径 / 权重 / 布局（可单测）
+lake-core.js       纯函数：半径 / 权重 / 布局
+test/              自检（node test/...，不需要 DSH 在跑）
 persona.seed.md    种子人格，随便改
 docs/design.md     设计文档
 locale/            中英文案
@@ -87,14 +90,25 @@ locale/            中英文案
 
 ---
 
+## 自检
+
+```bash
+npm test    # 或 node test/lake-core-test.mjs && node test/host-endpoint-test.mjs
+```
+
+`lake-core-test` 覆盖半径映射、环带边界、衰减曲线、散列分布；`host-endpoint-test` 会自己造一个 meow-memory 形状的临时库，把四个路由与工具真跑一遍，含坏库、超大请求、非法方法等容错用例。两个脚本都不需要宿主。
+
+---
+
 ## 已知状态 / 路线
 
 - [x] 涟漪数据模型与五环衰减
-- [x] 设置页：环带亮度、湖面预览、种子人格、心跳与冷却配置
+- [x] 设置页：环带亮度、湖面预览、种子人格、心跳与冷却配置（保存会真的落盘）
 - [x] 人格注入 + `lakemind_glimpse` 工具
+- [x] 顶栏 🌊 入口与全屏湖面（带返回按钮 / Esc 退出）
 - [ ] 年轮蒸馏：定时从记忆里提炼"我意识到自己……"
 - [ ] 心跳自主体：没人找时自己翻记忆、按闸门决定要不要开口
-- [ ] 湖面主面板（顶栏 🌊 入口）的完整视觉
+- [ ] 湖面主面板的完整视觉（现在只有环带与光点）
 
 ---
 
