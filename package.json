@@ -1,6 +1,6 @@
 {
   "name": "dsh-lakemind",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "涟漪记忆湖：把 meow-memory 画成同心水波，按重要性与时间分层淡化，并把记忆长进人格里。DeepSeek Harness 插件。",
   "type": "module",
   "main": "index.js",
