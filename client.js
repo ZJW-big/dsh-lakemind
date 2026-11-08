@@ -39,6 +39,8 @@ const LM_ZH = {
   nav: '记忆湖',
   panelTitle: '涟漪记忆湖',
   open: '记忆湖',
+  back: '返回对话',
+  backTitle: '返回对话（Esc）',
   empty: '湖面还是空的，等记忆慢慢长进来。',
   settingsTitle: '涟漪记忆湖',
   seedLabel: '种子人格（你可以直接编辑）',
@@ -61,6 +63,8 @@ const LM_EN = {
   nav: 'Memory Lake',
   panelTitle: 'Ripple Memory Lake',
   open: 'Lake',
+  back: 'Back to chat',
+  backTitle: 'Back to chat (Esc)',
   empty: 'The lake is still empty. Memories will grow in over time.',
   settingsTitle: 'Ripple Memory Lake',
   seedLabel: 'Seed persona (editable)',
@@ -88,6 +92,9 @@ const LM_CSS = [
   '.lm-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:.55;font-size:14px}',
   '.lm-top{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--dsw-alias-border-l1,#242a38);font-size:13px}',
   '.lm-top .lm-title{font-weight:600}',
+  '.lm-back{display:inline-flex;align-items:center;gap:4px;background:transparent;border:1px solid var(--dsw-alias-border-l2,#d8dde6);color:var(--dsw-alias-label-secondary,#8b98ad);border-radius:7px;padding:3px 10px;cursor:pointer;font:inherit;font-size:12px;line-height:18px;transition:color .15s,border-color .15s}',
+  '.lm-back:hover{border-color:rgba(212,168,83,.7);color:#f0d089}',
+  '.lm-back .lm-esc{opacity:.55;font-size:10.5px}',
 
   // ---- 设置页：土星夜景（深空底 + 冷白字 + 金色点缀）----
   '.lm-settings{display:flex;flex-direction:column;gap:16px;max-width:640px;padding:20px 22px 26px;border-radius:14px;background:radial-gradient(120% 120% at 15% 0%,#141c2e 0%,#0a0e17 55%,#070a11 100%);border:1px solid rgba(200,170,90,.22);box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05);color:#e8eef7;font-size:13px;line-height:1.6}',
@@ -233,27 +240,39 @@ function makeFactory() {
           g.fill();
 
           const ripples = (lake && lake.ripples) || [];
+          const dots = [];
           for (let i = 0; i < ripples.length; i++) {
             const r = ripples[i];
             if (r.status === 'archived') continue;
             const rad = Math.max(0, Math.min(1, r.radius)) * maxR;
-            const x = cx + Math.cos(r.angle) * rad;
-            const y = cy + Math.sin(r.angle) * rad;
             const wgt = Math.max(0, Math.min(1.4, Number(r.weight) || 0));
-            const alpha = 0.12 + Math.min(0.85, wgt * 0.62);
-            const size = 1.4 + Math.min(2.6, wgt * 2.2);
-            if (wgt > 0.35) {
-              const halo = g.createRadialGradient(x, y, 0, x, y, size * 5);
-              halo.addColorStop(0, 'hsla(' + r.hue + ',85%,72%,' + (alpha * 0.5).toFixed(3) + ')');
-              halo.addColorStop(1, 'hsla(' + r.hue + ',85%,72%,0)');
+            // 压暗 + 降饱和：这些是环带上的光尘，不是撒在画面上的白点
+            const alpha = 0.10 + Math.min(0.50, wgt * 0.38);
+            const size = 1.1 + Math.min(1.7, wgt * 1.3);
+            dots.push({
+              x: cx + Math.cos(r.angle) * rad,
+              y: cy + Math.sin(r.angle) * rad,
+              alpha: alpha,
+              size: size,
+              hue: Number(r.hue) || 220,
+              halo: wgt > 0.75,
+            });
+          }
+          for (let i = 0; i < dots.length; i++) {
+            const d = dots[i];
+            if (d.halo) {
+              const hr = d.size * 4;
+              const halo = g.createRadialGradient(d.x, d.y, 0, d.x, d.y, hr);
+              halo.addColorStop(0, 'hsla(' + d.hue + ',90%,66%,' + (d.alpha * 0.28).toFixed(3) + ')');
+              halo.addColorStop(1, 'hsla(' + d.hue + ',90%,66%,0)');
               g.fillStyle = halo;
               g.beginPath();
-              g.arc(x, y, size * 5, 0, Math.PI * 2);
+              g.arc(d.x, d.y, hr, 0, Math.PI * 2);
               g.fill();
             }
             g.beginPath();
-            g.arc(x, y, size, 0, Math.PI * 2);
-            g.fillStyle = 'hsla(' + r.hue + ', 88%, 72%, ' + alpha.toFixed(3) + ')';
+            g.arc(d.x, d.y, d.size, 0, Math.PI * 2);
+            g.fillStyle = 'hsla(' + d.hue + ', 92%, 64%, ' + d.alpha.toFixed(3) + ')';
             g.fill();
           }
 
@@ -287,12 +306,27 @@ function makeFactory() {
     // ---- 主面板 ----------------------------------------------------------
     function LakePanel(props) {
       const lang = props.lang || 'zh';
+      const onClose = props.onClose;
       const state = useState(null);
       const lake = state[0];
       const setLake = state[1];
       const errState = useState('');
       const err = errState[0];
       const setErr = errState[1];
+
+      // 主面板占的是 root 的 `main` keyed slot，会把会话界面整个换掉，
+      // 会话顶栏那个入口随之消失——所以这里必须自带出口：按钮 + Esc。
+      useEffect(function () {
+        if (typeof document === 'undefined' || typeof onClose !== 'function') return undefined;
+        function onKey(ev) {
+          if (ev && (ev.key === 'Escape' || ev.key === 'Esc')) {
+            ev.preventDefault();
+            onClose();
+          }
+        }
+        document.addEventListener('keydown', onKey);
+        return function () { document.removeEventListener('keydown', onKey); };
+      }, [onClose]);
 
       useEffect(function () {
         let alive = true;
@@ -321,6 +355,14 @@ function makeFactory() {
 
       return h('div', { className: 'lm-root' },
         h('div', { className: 'lm-top' },
+          typeof onClose === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'lm-back',
+              title: t(lang, 'backTitle'),
+              onClick: function () { onClose(); },
+            }, '← ' + t(lang, 'back'), h('span', { className: 'lm-esc' }, 'Esc'))
+            : null,
           h('span', { className: 'lm-title' }, t(lang, 'panelTitle')),
           err ? h('span', { className: 'lm-status', style: { color: '#ff8080' } }, err) : null,
         ),
@@ -548,11 +590,41 @@ function makeFactory() {
 
         function openPanel(id) {
           const layout = getLayout(ctx);
-          if (layout) {
-            layout.selectPanel(id);
-          } else {
+          if (!layout) {
             console.warn('[dsh-lakemind] layout service unavailable; cannot open panel');
+            return;
           }
+          try {
+            layout.selectPanel(id);
+          } catch (e) {
+            reportDiag('open-panel', e);
+          }
+        }
+
+        // selectPanel(null) 是宿主提供的“回到会话界面”，不改变当前会话。
+        function closePanel() {
+          const layout = getLayout(ctx);
+          if (!layout) return;
+          try {
+            layout.selectPanel(null);
+          } catch (e) {
+            reportDiag('close-panel', e);
+          }
+        }
+
+        // 顶栏入口做成开关：湖面已经开着就收起，否则打开。
+        function togglePanel() {
+          const layout = getLayout(ctx);
+          if (!layout) {
+            console.warn('[dsh-lakemind] layout service unavailable; cannot open panel');
+            return;
+          }
+          let active = null;
+          try {
+            if (layout.panelInfo) active = layout.panelInfo.activePanelId;
+          } catch (e) { /* 取不到就当作没开 */ }
+          if (active === 'lakemind') closePanel();
+          else openPanel('lakemind');
         }
 
         // 设置页用最成熟的注册方式（meow-memory / dsh-pet / better-sidebar 都这么干），同步注册。
@@ -563,8 +635,8 @@ function makeFactory() {
         if (typeof setTimeout === 'function') {
           setTimeout(function () {
             try {
-              registerPanel(ctx, lang, openPanel);
-              registerChip(ctx, lang, openPanel);
+              registerPanel(ctx, lang, closePanel);
+              registerChip(ctx, lang, togglePanel);
               lmTrace('late-registrations-done');
             } catch (e) {
               reportDiag('late-registrations', e);
@@ -593,13 +665,13 @@ function makeFactory() {
       }
     }
 
-    function registerPanel(ctx, lang) {
+    function registerPanel(ctx, lang, closePanel) {
       try {
         ctx.slots.inject('main', function* () {
           try {
             yield ctx.slots.register(
               { name: 'main', key: 'lakemind' },
-              function MainPanelEntry() { return h(LakePanel, { lang: lang }); },
+              function MainPanelEntry() { return h(LakePanel, { lang: lang, onClose: closePanel }); },
             );
           } catch (e) {
             console.warn('[dsh-lakemind] main panel registration failed: ' + (e && e.message ? e.message : String(e)));
@@ -612,13 +684,13 @@ function makeFactory() {
       }
     }
 
-    function registerChip(ctx, lang, openPanel) {
+    function registerChip(ctx, lang, togglePanel) {
       try {
         ctx.slots.inject('conversation.session.header.utilities', function* () {
           try {
             yield ctx.slots.register(
               { name: 'conversation.session.header.utilities', id: 'lakemind-entry', order: 500 },
-              function ChipEntry() { return h(LakeChip, { lang: lang, openPanel: openPanel }); },
+              function ChipEntry() { return h(LakeChip, { lang: lang, openPanel: togglePanel }); },
             );
           } catch (e) {
             console.warn('[dsh-lakemind] header chip registration failed: ' + (e && e.message ? e.message : String(e)));
