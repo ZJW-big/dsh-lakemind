@@ -41,6 +41,7 @@ const LM_ZH = {
   open: '记忆湖',
   back: '返回对话',
   backTitle: '返回对话（Esc）',
+  renderFailed: '渲染失败',
   empty: '湖面还是空的，等记忆慢慢长进来。',
   settingsTitle: '涟漪记忆湖',
   seedLabel: '种子人格（你可以直接编辑）',
@@ -65,6 +66,7 @@ const LM_EN = {
   open: 'Lake',
   back: 'Back to chat',
   backTitle: 'Back to chat (Esc)',
+  renderFailed: 'Render failed',
   empty: 'The lake is still empty. Memories will grow in over time.',
   settingsTitle: 'Ripple Memory Lake',
   seedLabel: 'Seed persona (editable)',
@@ -103,6 +105,8 @@ const LM_CSS = [
   '.lm-settings .lm-sub{margin:0;font-size:12px;color:#8fa0bd}',
   '.lm-settings .lm-bands{display:flex;flex-wrap:wrap;gap:6px 14px;padding:10px 12px;border-radius:9px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)}',
   '.lm-settings .lm-preview{position:relative;height:230px;border-radius:11px;overflow:hidden;border:1px solid rgba(120,150,200,.22);background:#080b12;box-shadow:inset 0 0 30px rgba(0,0,0,.6)}',
+  // 设置页里 .lm-wrap 不在 flex 容器里，靠 height:100% 撑不出高度，画布会溢出被裁掉一圈。
+  '.lm-settings .lm-preview>.lm-wrap{position:absolute;inset:0;height:auto}',
   '.lm-settings .lm-band{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:#a9b8d0;font-variant-numeric:tabular-nums}',
   '.lm-settings .lm-band-dot{width:7px;height:7px;border-radius:50%;display:inline-block;box-shadow:0 0 7px currentColor}',
   '.lm-settings .lm-field{display:flex;flex-direction:column;gap:6px}',
@@ -171,11 +175,39 @@ function makeFactory() {
       return dict[key] !== undefined ? dict[key] : key;
     }
 
+    // 真正的错误边界。DSH 会把崩溃的槽位换成空占位（页面上就是一片空白），
+    // 用 class 组件接住子树渲染异常，至少还能把原因显示出来。
+    // 只在外面套 try/catch 是不够的：渲染中途抛错会让 hooks 数量前后不一致，
+    // React 自己接着抛，兜底等于没兜。
+    function makeBoundary(label, renderFallback) {
+      class Boundary extends React.Component {
+        constructor(props) {
+          super(props);
+          this.state = { error: null };
+        }
+        static getDerivedStateFromError(error) {
+          return { error: error };
+        }
+        componentDidCatch(error) {
+          reportDiag('boundary:' + label, error);
+        }
+        render() {
+          if (this.state.error) return renderFallback(this.state.error);
+          return this.props.children;
+        }
+      }
+      return Boundary;
+    }
+
     // ---- 湖面 ------------------------------------------------------------
     function LakeCanvas(props) {
       const lake = props.lake;
       const lang = props.lang || 'zh';
       const ref = useRef(null);
+      // 数据用 ref 带进去：否则每次 5 秒轮询拿到新对象都会重建 useEffect、
+      // 把 requestAnimationFrame 拆掉重来，呼吸动画每 5 秒顿一下。
+      const lakeRef = useRef(lake);
+      lakeRef.current = lake;
 
       useEffect(function () {
         const cvs = ref.current;
@@ -209,7 +241,8 @@ function makeFactory() {
           const cx = cw / 2;
           const cy = ch / 2;
           const maxR = Math.min(cw, ch) * 0.45;
-          const bands = (lake && lake.bandBrightness) || {};
+          const lakeNow = lakeRef.current;
+          const bands = (lakeNow && lakeNow.bandBrightness) || {};
           const bright = [];
           for (let i = 0; i < 5; i++) bright.push(Number(bands[i] || bands[String(i)] || 0));
 
@@ -239,7 +272,7 @@ function makeFactory() {
           g.fillStyle = '#fff4d6';
           g.fill();
 
-          const ripples = (lake && lake.ripples) || [];
+          const ripples = (lakeNow && lakeNow.ripples) || [];
           const dots = [];
           for (let i = 0; i < ripples.length; i++) {
             const r = ripples[i];
@@ -282,7 +315,7 @@ function makeFactory() {
 
         raf = requestAnimationFrame(draw);
         return function () { cancelAnimationFrame(raf); };
-      }, [lake]);
+      }, []);
 
       const bandLine = (function () {
         if (!lake || !lake.bandBrightness) return '';
@@ -372,9 +405,9 @@ function makeFactory() {
 
     // ---- 设置页（用工厂函数创建，模仿 dsh-pet 的结构）----------------------
     function makeSettingsPanel(deps) {
-      const { h, useState, t, reportDiag, LakeCanvas } = deps;
+      const { h, useState, useEffect, useRef, t, reportDiag, LakeCanvas, lang } = deps;
       function SettingsPanelBody() {
-        const translate = function (k) { return t('zh', k); };
+        const translate = function (k) { return t(lang || 'zh', k); };
 
         const s1 = useState(null);
         const seed = s1[0];
@@ -388,37 +421,64 @@ function makeFactory() {
         const s4 = useState(null);
         const stats = s4[0];
         const setStats = s4[1];
-        const s5 = useState(false);
-        const loaded = s5[0];
-        const setLoaded = s5[1];
+        const timerRef = useRef(0);
 
-        if (!loaded) {
-          setLoaded(true);
+        // 默认值必须在加载时就写进 cfg：之前只在渲染时用 fallback 显示，
+        // 结果点「保存」发上去的是一份空对象，心跳与冷却从来没落过盘。
+        useEffect(function () {
+          let alive = true;
           Promise.all([
             fetch('/lakemind-7350/seed').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
             fetch('/lakemind-7350/config').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
             fetch('/lakemind-7350/state').then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
           ]).then(function (both) {
+            if (!alive) return;
             if (both[0] && typeof both[0].seed === 'string') setSeed(both[0].seed);
-            if (both[1] && typeof both[1] === 'object') setCfg(both[1]);
+            const saved = both[1] && typeof both[1] === 'object' ? both[1] : {};
+            setCfg(Object.assign({ heartbeatMinutes: 10, cooldownMinutes: 90, speakUp: true }, saved));
             if (both[2] && both[2].lake) setStats(both[2].lake);
-          });
-        }
+          }).catch(function () {});
+          return function () { alive = false; };
+        }, []);
+
+        useEffect(function () {
+          return function () {
+            if (timerRef.current) clearTimeout(timerRef.current);
+          };
+        }, []);
 
         function save() {
-          fetch('/lakemind-7350/config', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify(cfg),
-          })
-            .then(function (res) {
-              setMsg(res.ok ? translate('saved') : translate('saveFailed') + ' HTTP ' + res.status);
+          const config = {
+            heartbeatMinutes: Number(cfg.heartbeatMinutes) > 0 ? Number(cfg.heartbeatMinutes) : 10,
+            cooldownMinutes: Number(cfg.cooldownMinutes) > 0 ? Number(cfg.cooldownMinutes) : 90,
+            speakUp: cfg.speakUp !== false,
+          };
+          const jobs = [
+            fetch('/lakemind-7350/config', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(config),
+            }),
+            // 种子人格也要发：之前只 POST 配置，textarea 里改的内容存完就丢了。
+            seed === null
+              ? Promise.resolve({ ok: true, status: 204 })
+              : fetch('/lakemind-7350/seed', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ seed: String(seed) }),
+              }),
+          ];
+          Promise.all(jobs)
+            .then(function (results) {
+              const bad = results.find(function (r) { return !r.ok; });
+              setMsg(bad ? translate('saveFailed') + ' HTTP ' + bad.status : translate('saved'));
             })
             .catch(function (e) {
               setMsg(translate('saveFailed') + ' ' + (e && e.message ? e.message : String(e)));
             })
             .then(function () {
-              setTimeout(function () { setMsg(''); }, 2500);
+              if (timerRef.current) clearTimeout(timerRef.current);
+              timerRef.current = setTimeout(function () { setMsg(''); }, 2500);
             });
         }
 
@@ -502,18 +562,18 @@ function makeFactory() {
         );
       }
 
-      // 渲染异常兜底：DSH 会把崩溃的槽位换成空占位（页面上就是一片空白），
-      // 所以这里自己捕住、把堆栈写给宿主，同时给出可读的错误提示。
+      // 渲染异常兜底交给错误边界：崩溃时页面上还能看到原因，而不是一片空白。
+      const SettingsBoundary = makeBoundary('settings', function (error) {
+        return h('section', { className: 'lm-settings' },
+          h('h2', { className: 'lm-title-lg' }, '🪐 ' + t(lang || 'zh', 'nav')),
+          h('p', { className: 'lm-sub' },
+            t(lang || 'zh', 'renderFailed') + '：' + (error && error.message ? error.message : String(error)),
+          ),
+        );
+      });
+
       return function SettingsPanel() {
-        try {
-          return SettingsPanelBody();
-        } catch (e) {
-          reportDiag('settings-render', e);
-          return h('section', { className: 'lm-settings' },
-            h('h2', { className: 'lm-title-lg' }, '🪐 记忆湖'),
-            h('p', { className: 'lm-sub' }, '渲染失败：' + (e && e.message ? e.message : String(e))),
-          );
-        }
+        return h(SettingsBoundary, null, h(SettingsPanelBody));
       };
     }
 
@@ -652,7 +712,7 @@ function makeFactory() {
 
     function registerSection(ctx, lang) {
       try {
-        const SettingsPanel = makeSettingsPanel({ h, useState, t, reportDiag, LakeCanvas });
+        const SettingsPanel = makeSettingsPanel({ h, useState, useEffect, useRef, t, reportDiag, LakeCanvas, lang });
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
           id: 'lakemind-settings',
@@ -666,12 +726,27 @@ function makeFactory() {
     }
 
     function registerPanel(ctx, lang, closePanel) {
+      // 主面板崩了也得能退出去，所以兜底页里保留了返回按钮。
+      const PanelBoundary = makeBoundary('main-panel', function (error) {
+        return h('div', { className: 'lm-root' },
+          h('div', { className: 'lm-top' },
+            h('button', { type: 'button', className: 'lm-back', onClick: function () { closePanel(); } },
+              '← ' + t(lang, 'back')),
+            h('span', { className: 'lm-title' }, t(lang, 'panelTitle')),
+          ),
+          h('div', { className: 'lm-empty' },
+            t(lang, 'renderFailed') + '：' + (error && error.message ? error.message : String(error)),
+          ),
+        );
+      });
       try {
         ctx.slots.inject('main', function* () {
           try {
             yield ctx.slots.register(
               { name: 'main', key: 'lakemind' },
-              function MainPanelEntry() { return h(LakePanel, { lang: lang, onClose: closePanel }); },
+              function MainPanelEntry() {
+                return h(PanelBoundary, null, h(LakePanel, { lang: lang, onClose: closePanel }));
+              },
             );
           } catch (e) {
             console.warn('[dsh-lakemind] main panel registration failed: ' + (e && e.message ? e.message : String(e)));
@@ -705,6 +780,9 @@ function makeFactory() {
 
     if (typeof document !== 'undefined') {
       try {
+        // bundle 若被重复求值，先拆掉旧样式表，避免同一份 CSS 越堆越多。
+        const stale = document.querySelectorAll('style[data-dsh-lakemind]');
+        for (let i = 0; i < stale.length; i++) stale[i].remove();
         const el = document.createElement('style');
         el.setAttribute('data-dsh-lakemind', '');
         el.textContent = LM_CSS;
